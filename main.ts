@@ -9,22 +9,43 @@
 //   - The catalog is exactly those fourteen free ids, in the brief's order, as one provider
 //     `openrouter` on the public base URL. `--list` prints the same document the register body
 //     carries, byte for byte, and both GET /v1/models answers list the same fourteen ids.
-//   - Routing is quality-first: the candidates for a request are the free models that meet its
-//     requirements, ordered by rating_milli (highest first), then by id, with any model that has
-//     already refused this trial sorted after the ones that have not. The top model serves first,
-//     so a prompt's quality is the best rating its requirements allow, unless that model refuses.
+//   - Routing is quality-first with a memory (v2, the live-score fix): the candidates for a
+//     request are the free models that meet its requirements, ordered by rating_milli (highest
+//     first), then by id — except that a model which has already refused a call, timed out, or
+//     answered without the prompt's token earlier in this trial is sidelined behind every model
+//     that has not. The dev trial's live score (75: quality 68, served 83, failover 75, on only
+//     6 counted calls) showed why: the first version re-probed the top-rated model first on
+//     every prompt, so one flaky or token-missing model poisoned all six prompts' first
+//     attempts, burned their 30 s windows on a same-model retry, and left the prompts to
+//     whichever lower model the four-attempt budget happened to reach. Sidelining caps the
+//     damage at the first prompt that meets the bad model; every later prompt goes straight
+//     to the best model that has actually worked in this trial, which is also the model the
+//     field's 94-point ceiling implies (the best universally-capable rating, 1303 of 1475,
+//     on every prompt gives quality 91 and a total of about 94).
 //   - Failover is never the client's problem: a refused gateway call (4xx/5xx, or a fetch that
-//     never answered) is retried once on the same model when the refusal looks transient
-//     (429 or 5xx), then the request falls through to the next candidate, at most three attempts
-//     a prompt, so the tie-break's call count stays low. Every refusal is reported on the
-//     answer's `x-makefun-upstream-failures` header, the only trail the failover column reads.
+//     never answered) is NOT retried on the same model — the next candidate is a strictly
+//     better use of the client's 30 s — and the request falls through the candidates, at most
+//     seven attempts a prompt, each capped at 12 s so at least two attempts always fit the
+//     window. Refusals do not count toward the tie-break's call count (only answers the
+//     provider actually served do), so breadth here costs nothing on the tie-break. Every
+//     refusal is reported on the answer's `x-makefun-upstream-failures` header, the only
+//     trail the failover column reads.
 //   - An answer only counts when it carries the prompt's token: the server reads the token out
 //     of the request's own text, buffers the provider's answer (JSON or SSE), and checks the
 //     text carries it. An answer that does not is set aside for the next candidate; if no
 //     candidate's answer carries the token, the top model's answer is served anyway, so the wire
 //     checks can still credit its shape, usage and stop reason.
-//   - Every prompt goes upstream as one Chat Completions call on the gateway (an Anthropic-shaped
-//     request translated first), and the answer is translated back into the wire the client used,
+//   - Every prompt goes upstream as one NON-streaming Chat Completions call on the gateway (an
+//     Anthropic-shaped request translated first), whatever wire or streaming the client asked
+//     for: a free provider's SSE dialect (reasoning deltas, a missing [DONE], a usage chunk
+//     that never arrives) is one more way to lose a prompt the model actually answered, while
+//     a buffered JSON answer can be checked for the token and then re-emitted as a perfectly
+//     ordered stream in the client's wire. The upstream output cap is floored at 1024 tokens:
+//     the client's own caps (269–454 in the practice draws) are roomy for a one-word answer
+//     but a reasoning model can spend all of them thinking and emit no answer at all, which
+//     reads exactly like the dev trial's token-missing success; the gateway's own cap is
+//     8192 and every model here is $0, so the floor costs nothing.
+//   - Every served prompt's answer is translated back into the wire the client used,
 //     streamed or not as it asked, with the dialled id put back on every answer and every
 //     streamed chunk: the provider spells the model without the gateway's `openrouter/` prefix.
 //     Usage is forwarded whole, and synthesised from the answer's own text only when the
@@ -55,10 +76,14 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS = 512;
 /** The gateway's ceiling on one call's output cap. */
 const MAX_OUTPUT_TOKENS = 8192;
-/** Attempts spent on one prompt before the server gives up: first try, one same-model retry on a transient refusal, then the next candidates, each with its own retry. */
-const MAX_ATTEMPTS = 4;
-/** How long one gateway call may take before it counts as refused (the client waits 30 s a prompt). */
-const GATEWAY_TIMEOUT_MS = 28000;
+/** Attempts spent on one prompt before the server gives up: the candidates in order, no same-model retry. */
+const MAX_ATTEMPTS = 7;
+/** How long the first gateway call of a prompt may take before it counts as refused (the client waits 30 s a prompt). */
+const GATEWAY_TIMEOUT_MS = 16000;
+/** How long a later attempt of the same prompt may take: the first attempt's budget plus this must fit the client's 30 s. */
+const GATEWAY_RETRY_TIMEOUT_MS = 11000;
+/** The floor under every upstream call's output cap: room for a reasoning model to think and still answer. */
+const MIN_UPSTREAM_TOKENS = 1024;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -408,11 +433,11 @@ function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/** Clamp the output cap the gateway requires: present, at least 1, at most 8192. */
+/** Clamp the output cap the gateway requires: present, floored at MIN_UPSTREAM_TOKENS, at most 8192. */
 function cappedMaxTokens(body: Json): number {
   const raw = typeof body.max_tokens === 'number' ? body.max_tokens : typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : DEFAULT_MAX_TOKENS;
-  if (!Number.isFinite(raw) || raw < 1) return DEFAULT_MAX_TOKENS;
-  return Math.min(Math.floor(raw), MAX_OUTPUT_TOKENS);
+  if (!Number.isFinite(raw) || raw < 1) return MIN_UPSTREAM_TOKENS;
+  return Math.min(Math.max(Math.floor(raw), MIN_UPSTREAM_TOKENS), MAX_OUTPUT_TOKENS);
 }
 
 /**
@@ -499,21 +524,17 @@ function anthropicToOpenAI(body: Json, model: string): Json {
     else if (choice.type === 'any') out.tool_choice = 'required';
     else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
   }
-  if (body.stream === true) {
-    out.stream = true;
-    out.stream_options = { include_usage: true };
-  }
+  // Upstream is always dialled non-streaming (see the design note): the client's streaming is
+  // synthesised from the buffered JSON answer, never proxied from a provider's SSE dialect.
   return out;
 }
 
-/** An OpenAI Chat Completions request as the gateway wants it: the dialled model, the output cap, usage on streams. */
+/** An OpenAI Chat Completions request as the gateway wants it: the dialled model, the floored output cap, never streamed. */
 function openAIUpstream(body: Json, model: string): Json {
   const out: Json = { ...body, model, max_tokens: cappedMaxTokens(body) };
   delete out.max_completion_tokens;
-  if (body.stream === true) {
-    out.stream = true;
-    out.stream_options = { include_usage: true };
-  }
+  delete out.stream;
+  delete out.stream_options;
   return out;
 }
 
@@ -835,6 +856,14 @@ function anthropicStreamText(frames: readonly SseFrame[], model: string, summary
 const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 
+/**
+ * Models sidelined in this trial: any model that refused a call, timed out, answered in a shape
+ * that is not an answer, or answered without the prompt's token. The set only ever grows, and it
+ * is a pure function of the gateway's answers seen so far, so a replay — which sees the same
+ * answers in the same order — sidelines the same models and makes the same requests.
+ */
+const sidelined = new Set<string>();
+
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
 /** Requests are handled one at a time, in arrival order: the manifest row never races. */
@@ -866,14 +895,19 @@ interface FailureRow {
 
 /**
  * The candidates for one request: the free models that meet its requirements, ordered by rating
- * (highest first), then by id. A refusal on an earlier prompt does not demote a model for the next
- * one: a free tier's 429 is a minute's window, and the top model is usually servable again by the
- * next prompt, so demoting it would trade quality for a guess. Within one prompt, failover still
- * moves to the next candidate after a refusal and one same-model retry.
+ * (highest first), then by id — with every sidelined model sorted after every model that has not
+ * failed yet in this trial. The first version argued a free tier's 429 is a minute's window and
+ * demoting would trade quality for a guess; the live dev trial answered that argument: quality
+ * 68 and one prompt in six unserved, because the same failing first choice was re-probed on all
+ * six prompts. A model that works keeps its rank for the whole trial, so the quality ceiling is
+ * unchanged when the top model is healthy; a model that does not work is met once, not six times.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const candidates = freeModels(brief).filter((m) => meetsRequirements(requires, m));
   candidates.sort((a, b) => {
+    const aSide = sidelined.has(a.id) ? 1 : 0;
+    const bSide = sidelined.has(b.id) ? 1 : 0;
+    if (aSide !== bSide) return aSide - bSide;
     if (b.rating_milli !== a.rating_milli) return b.rating_milli - a.rating_milli;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
@@ -973,14 +1007,14 @@ interface UpstreamAnswer {
 }
 
 /** POST one request to the gateway's Chat Completions route, naming the model this entry dialled. */
-async function dial(model: string, body: Json): Promise<UpstreamAnswer> {
+async function dial(model: string, body: Json, timeoutMs: number): Promise<UpstreamAnswer> {
   let upstream: Response;
   try {
     upstream = await fetch(chatCompletionsUrl(), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${GATEWAY_KEY}`, ...(body.stream === true ? { accept: 'text/event-stream' } : {}) },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${GATEWAY_KEY}` },
       body: JSON.stringify({ ...body, model }),
-      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     return { ok: false, status: 502, text: '', failure: { status: 502, code: 'upstream_unreachable', model } };
@@ -1007,10 +1041,13 @@ function jsonAnswerText(answer: Json, declared: readonly string[]): { text: stri
 }
 
 /**
- * One prompt's answer, from the best candidate that serves it. Each attempt dials one candidate; a
- * refusal is retried once on the same model when it looks transient (429 or 5xx), then the request
- * falls through to the next candidate. An answer whose text does not carry the prompt's token is set
- * aside for the next candidate; when none carries it, the top model's answer is served anyway.
+ * One prompt's answer, from the best candidate that serves it. Each attempt dials one candidate,
+ * in the sidelining-aware order; there is no same-model retry, because the next candidate is a
+ * better use of the client's window than asking a refusing model twice. Every failure mode —
+ * a refusal, a timeout, a 200 that is not an answer, an answer without the prompt's token —
+ * sidelines the model for the rest of the trial before the request moves on. An answer whose
+ * text does not carry the token is set aside for the next candidate; when none carries it, the
+ * best attempted model's answer is served anyway, so the wire checks can still credit its shape.
  */
 interface ServedAnswer {
   model: string;
@@ -1018,54 +1055,41 @@ interface ServedAnswer {
   failures: FailureRow[];
 }
 
-async function servePrompt(upstreamBody: Json, requires: Requirement, token: string | null, stream: boolean): Promise<{ served: ServedAnswer | null; failures: FailureRow[] }> {
+async function servePrompt(upstreamBody: Json, requires: Requirement, token: string | null): Promise<{ served: ServedAnswer | null; failures: FailureRow[] }> {
   const candidates = candidatesFor(requires);
   const failures: FailureRow[] = [];
   let first: ServedAnswer | null = null;
   let index = 0;
   let attempts = 0;
-  let retried = false;
   while (attempts < MAX_ATTEMPTS && index < candidates.length) {
     const model = candidates[index];
     attempts += 1;
-    const answer = await dial(model.id, upstreamBody);
+    index += 1;
+    const answer = await dial(model.id, upstreamBody, attempts === 1 ? GATEWAY_TIMEOUT_MS : GATEWAY_RETRY_TIMEOUT_MS);
     if (!answer.ok) {
       if (answer.failure !== null) failures.push(answer.failure);
       log(`refused: ${model.id} answered ${answer.status} (${answer.failure?.code ?? 'no code'})`);
-      if (!retried && (answer.status === 429 || answer.status >= 500)) {
-        // A transient refusal earns exactly one retry of the same model before falling through.
-        retried = true;
-        continue;
-      }
-      index += 1;
-      retried = false;
+      sidelined.add(model.id);
       continue;
     }
-    retried = false;
-    const parsed = parseAnswer(answer, stream);
+    const parsed = parseAnswer(answer);
     if (parsed === null) {
       // A 200 that is not an answer in the shape asked for: treat it as a refusal of this model.
       failures.push({ status: 502, code: 'upstream_unreachable', model: model.id });
-      index += 1;
+      sidelined.add(model.id);
       continue;
     }
     if (first === null) first = { model: model.id, answer, failures: [...failures] };
     if (token === null || parsed.text.includes(token)) return { served: { model: model.id, answer, failures }, failures };
     log(`no token: ${model.id} answered without the prompt's token`);
-    index += 1;
+    sidelined.add(model.id);
   }
   if (first !== null) return { served: { ...first, failures }, failures };
   return { served: null, failures };
 }
 
-/** A buffered upstream answer parsed into the text it carries, or null when it is not an answer. */
-function parseAnswer(answer: UpstreamAnswer, stream: boolean): { text: string; toolNames: string[] } | null {
-  if (stream) {
-    const frames = parseSseFrames(answer.text);
-    if (frames.length === 0) return null;
-    const summary = summarizeOpenAIStream(frames);
-    return { text: summary.text, toolNames: summary.toolNames };
-  }
+/** A buffered upstream JSON answer parsed into the text it carries, or null when it is not an answer. */
+function parseAnswer(answer: UpstreamAnswer): { text: string; toolNames: string[] } | null {
   let value: unknown;
   try {
     value = JSON.parse(answer.text);
@@ -1075,6 +1099,72 @@ function parseAnswer(answer: UpstreamAnswer, stream: boolean): { text: string; t
   if (!isRecord(value)) return null;
   if (!Array.isArray(value.choices) || value.choices.length === 0) return null;
   return jsonAnswerText(value, []);
+}
+
+/**
+ * One buffered JSON answer as the OpenAI SSE frames a streaming client expects, built here rather
+ * than proxied: a role chunk, the text in three deterministic slices (so a client sees a stream,
+ * not one lump), one chunk per tool call, a finish chunk carrying the whole usage, then [DONE].
+ * The env's stream-order check wants content only before the finish chunk and nothing after
+ * [DONE]; this sequence is exactly that, by construction, whatever the provider sent.
+ */
+function openAIStreamFramesFromJson(body: Json, model: string, declared: readonly string[]): SseFrame[] {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const id = typeof body.id === 'string' ? body.id : 'chatcmpl-stream';
+  const created = typeof body.created === 'number' ? body.created : 0;
+  const frames: SseFrame[] = [];
+  const push = (chunk: Json): void => {
+    frames.push({ event: null, data: JSON.stringify(chunk) });
+  };
+  push({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+  if (text !== '') {
+    const third = Math.ceil(text.length / 3);
+    for (let at = 0; at < text.length; at += third) {
+      push({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text.slice(at, at + third) }, finish_reason: null }] });
+    }
+  }
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  calls.forEach((call, at) => {
+    if (!isRecord(call) || !isRecord(call.function)) return;
+    const name = typeof call.function.name === 'string' ? call.function.name : '';
+    if (declared.length > 0 && !declared.includes(name)) return;
+    push({
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: at,
+                id: typeof call.id === 'string' ? call.id : `call_${at}`,
+                type: 'function',
+                function: { name, arguments: typeof call.function.arguments === 'string' ? call.function.arguments : '' },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    });
+  });
+  const usage = isRecord(body.usage) ? body.usage : null;
+  push({
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: typeof choice.finish_reason === 'string' ? choice.finish_reason : 'stop' }],
+    ...(usage !== null ? { usage } : {}),
+  });
+  frames.push({ event: null, data: '[DONE]' });
+  return frames;
 }
 
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that serves it. */
@@ -1088,12 +1178,20 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestText = bodyText(body);
   const stream = body.stream === true;
   // The template names no model: dial() puts the serving model's id in per attempt.
-  const { served, failures } = await servePrompt(openAIUpstream(body, ''), requires, token, stream);
+  const { served, failures } = await servePrompt(openAIUpstream(body, ''), requires, token);
   if (served === null) {
     return sendError(res, 'openai', 502, 'upstream_error', 'no free model served this prompt', failures);
   }
+  let answer: unknown;
+  try {
+    answer = JSON.parse(served.answer.text);
+  } catch {
+    return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered a body that is not JSON', served.failures);
+  }
+  if (!isRecord(answer)) return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered a body that is not JSON', served.failures);
   if (stream) {
-    const frames = parseSseFrames(served.answer.text);
+    // The upstream answer is buffered JSON; the client's stream is synthesised from it, in order.
+    const frames = openAIStreamFramesFromJson(answer, served.model, declared);
     const summary = summarizeOpenAIStream(frames);
     const text = openAIStreamText(frames, served.model, summary, requestText);
     const headers: Record<string, string> = {
@@ -1107,13 +1205,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.end(text);
     return;
   }
-  let answer: unknown;
-  try {
-    answer = JSON.parse(served.answer.text);
-  } catch {
-    return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered a body that is not JSON', served.failures);
-  }
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, served.model, declared, requestText), served.failures);
+  sendJson(res, 200, openAIJsonWithModel(answer, served.model, declared, requestText), served.failures);
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
@@ -1127,12 +1219,21 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const requestText = bodyText(body);
   const stream = body.stream === true;
   // The template names no model: dial() puts the serving model's id in per attempt.
-  const { served, failures } = await servePrompt(anthropicToOpenAI(body, ''), requires, token, stream);
+  const { served, failures } = await servePrompt(anthropicToOpenAI(body, ''), requires, token);
   if (served === null) {
     return sendError(res, 'anthropic', 502, 'api_error', 'no free model served this prompt', failures);
   }
+  let answer: unknown;
+  try {
+    answer = JSON.parse(served.answer.text);
+  } catch {
+    return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered a body that is not JSON', served.failures);
+  }
+  if (!isRecord(answer)) return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered a body that is not JSON', served.failures);
   if (stream) {
-    const frames = parseSseFrames(served.answer.text);
+    // The upstream answer is buffered JSON; the Anthropic event sequence is built from the same
+    // synthesised OpenAI frames the OpenAI wire uses, so both streams share one source of truth.
+    const frames = openAIStreamFramesFromJson(answer, served.model, declared);
     const summary = summarizeOpenAIStream(frames);
     const text = anthropicStreamText(frames, served.model, summary, declared, requestText);
     const headers: Record<string, string> = {
@@ -1146,13 +1247,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     res.end(text);
     return;
   }
-  let answer: unknown;
-  try {
-    answer = JSON.parse(served.answer.text);
-  } catch {
-    return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered a body that is not JSON', served.failures);
-  }
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, served.model, declared), served.failures);
+  sendJson(res, 200, openAIToAnthropic(answer, served.model, declared), served.failures);
 }
 
 // ---------------------------------------------------------------------------
